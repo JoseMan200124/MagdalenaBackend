@@ -1,0 +1,33 @@
+# ===== Node =====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# ===== Environment =====
+.env
+.env.*
+!.env.example
+
+# ===== Data (usuarios en TXT) =====
+data/users.txt
+data/*.bak
+data/*.tmp
+
+# Si quieres ignorar toda la carpeta data (opcional):
+# data/
+
+# ===== OS / Editor =====
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+*.iml
+
+# ===== Docker =====
+*.pid
+*.seed
+*.lock
