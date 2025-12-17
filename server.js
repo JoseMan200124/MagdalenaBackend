@@ -3,14 +3,25 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-const { readUsers, writeUsers, findByUsername, makeUser, sanitizeUser } = require("./lib/usersStore");
+const {
+  ensureStore,
+  sanitizeUser,
+  listUsers,
+  getUserById,
+  findByUsername,
+  countAdmins,
+  createUser,
+  updateUser,
+  deleteUser,
+  isUniqueViolation,
+} = require("./lib/usersStore");
+
 const { signToken, requireAuth, requireAdmin } = require("./lib/auth");
 const { randomPassword } = require("./lib/utils");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// CORS: si FRONTEND_ORIGIN está definido, restringimos; si no, permitimos cualquiera (demo).
 const frontendOrigin = (process.env.FRONTEND_ORIGIN || "").trim();
 app.use(
     cors({
@@ -19,7 +30,6 @@ app.use(
     })
 );
 
-// Healthcheck
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 function normRole(role) {
@@ -27,13 +37,9 @@ function normRole(role) {
   return r === "admin" ? "admin" : "viewer";
 }
 
-function countAdmins(users) {
-  return users.filter((u) => String(u.role) === "admin").length;
-}
-
-// ✅ Bootstrap: asegura que exista al menos 1 admin inicial (pero NO fuerza a los demás a viewer)
+// Bootstrap: asegura que exista al menos 1 admin inicial
 async function bootstrapAtLeastOneAdmin() {
-  const users = await readUsers();
+  await ensureStore();
 
   const adminUser = String(
       process.env.DEFAULT_ADMIN_USER || process.env.SINGLE_ADMIN_USERNAME || "admin@magdalena.com"
@@ -43,28 +49,23 @@ async function bootstrapAtLeastOneAdmin() {
       process.env.DEFAULT_ADMIN_PASS || process.env.SINGLE_ADMIN_PASSWORD || "12345"
   ).trim();
 
-  const lower = (s) => String(s || "").trim().toLowerCase();
-
-  let changed = false;
-  let admin = users.find((u) => lower(u.username) === lower(adminUser));
+  let admin = await findByUsername(adminUser);
 
   if (!admin) {
-    users.push(makeUser({ username: adminUser, password: adminPass, role: "admin" }));
-    changed = true;
+    await createUser({ username: adminUser, password: adminPass, role: "admin" });
     console.log(`[bootstrap] Created admin user: ${adminUser}`);
-  } else {
-    if (admin.role !== "admin") {
-      admin.role = "admin";
-      changed = true;
-    }
-    if (!admin.password) {
-      admin.password = adminPass;
-      changed = true;
-    }
-    admin.updatedAt = new Date().toISOString();
+    return;
   }
 
-  if (changed) await writeUsers(users);
+  // Forzamos que exista como admin + que tenga password (si por alguna razón estaba vacío)
+  const patch = {};
+  if (String(admin.role) !== "admin") patch.role = "admin";
+  if (!admin.password) patch.password = adminPass;
+
+  if (Object.keys(patch).length) {
+    await updateUser(admin.id, patch);
+    console.log(`[bootstrap] Updated admin user: ${adminUser}`);
+  }
 }
 
 // -------- AUTH --------
@@ -74,8 +75,7 @@ app.post("/api/auth/login", async (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: "username and password required" });
 
-    const users = await readUsers();
-    const user = findByUsername(users, username);
+    const user = await findByUsername(username);
     if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
     // PoC: contraseñas sin cifrar
@@ -89,11 +89,10 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-// ✅ /me debe venir del STORE para reflejar permisos reales
+// /me desde Postgres
 app.get("/api/me", requireAuth, async (req, res) => {
   try {
-    const users = await readUsers();
-    const u = users.find((x) => String(x.id) === String(req.auth.sub));
+    const u = await getUserById(req.auth.sub);
     if (!u) return res.status(401).json({ error: "User not found" });
     return res.json({ user: sanitizeUser(u) });
   } catch (e) {
@@ -106,7 +105,7 @@ app.get("/api/me", requireAuth, async (req, res) => {
 
 app.get("/api/users", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const users = await readUsers();
+    const users = await listUsers();
     return res.json({ items: users.map(sanitizeUser) });
   } catch (e) {
     console.error(e);
@@ -120,21 +119,20 @@ app.post("/api/users", requireAuth, requireAdmin, async (req, res) => {
     const u = String(username || "").trim();
     if (!u) return res.status(400).json({ error: "username required" });
 
-    const users = await readUsers();
-    if (findByUsername(users, u)) return res.status(409).json({ error: "username already exists" });
-
     let pass = String(password || "");
     if (!pass || generatePassword) pass = randomPassword(12);
 
-    const newUser = makeUser({ username: u, password: pass, role: normRole(role) });
-    users.push(newUser);
-    await writeUsers(users);
+    try {
+      const newUser = await createUser({ username: u, password: pass, role: normRole(role) });
 
-    // Devolvemos la contraseña solo al crear (si la generamos) para mostrarla una vez.
-    return res.status(201).json({
-      user: sanitizeUser(newUser),
-      generatedPassword: (!password || generatePassword) ? pass : null,
-    });
+      return res.status(201).json({
+        user: sanitizeUser(newUser),
+        generatedPassword: (!password || generatePassword) ? pass : null,
+      });
+    } catch (e) {
+      if (isUniqueViolation(e)) return res.status(409).json({ error: "username already exists" });
+      throw e;
+    }
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Server error" });
@@ -146,47 +144,45 @@ app.put("/api/users/:id", requireAuth, requireAdmin, async (req, res) => {
     const id = String(req.params.id || "");
     const { username, password, generatePassword, role } = req.body || {};
 
-    const users = await readUsers();
-    const idx = users.findIndex((u) => String(u.id) === id);
-    if (idx < 0) return res.status(404).json({ error: "not found" });
+    const current = await getUserById(id);
+    if (!current) return res.status(404).json({ error: "not found" });
 
-    // Si cambia username, validar unique
+    // username
+    const patch = {};
     if (username != null) {
       const nu = String(username).trim();
       if (!nu) return res.status(400).json({ error: "username cannot be empty" });
-
-      const exists = users.find(
-          (x) => String(x.id) !== id && String(x.username).toLowerCase() === nu.toLowerCase()
-      );
-      if (exists) return res.status(409).json({ error: "username already exists" });
-
-      users[idx].username = nu;
+      patch.username = nu;
     }
 
     // role: proteger último admin
     if (role != null) {
       const nextRole = normRole(role);
-      const wasAdmin = String(users[idx].role) === "admin";
-      const admins = countAdmins(users);
+      const wasAdmin = String(current.role) === "admin";
 
-      if (wasAdmin && nextRole !== "admin" && admins <= 1) {
-        return res.status(400).json({ error: "You cannot remove the last admin" });
+      if (wasAdmin && nextRole !== "admin") {
+        const admins = await countAdmins();
+        if (admins <= 1) return res.status(400).json({ error: "You cannot remove the last admin" });
       }
-      users[idx].role = nextRole;
+      patch.role = nextRole;
     }
 
+    // password
     let generated = null;
     if (generatePassword) {
       generated = randomPassword(12);
-      users[idx].password = generated;
+      patch.password = generated;
     } else if (password != null) {
-      users[idx].password = String(password);
+      patch.password = String(password);
     }
 
-    users[idx].updatedAt = new Date().toISOString();
-    await writeUsers(users);
-
-    return res.json({ user: sanitizeUser(users[idx]), generatedPassword: generated });
+    try {
+      const updated = await updateUser(id, patch);
+      return res.json({ user: sanitizeUser(updated), generatedPassword: generated });
+    } catch (e) {
+      if (isUniqueViolation(e)) return res.status(409).json({ error: "username already exists" });
+      throw e;
+    }
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: "Server error" });
@@ -196,22 +192,19 @@ app.put("/api/users/:id", requireAuth, requireAdmin, async (req, res) => {
 app.delete("/api/users/:id", requireAuth, requireAdmin, async (req, res) => {
   try {
     const id = String(req.params.id || "");
-    const users = await readUsers();
 
     // Evita que el admin se borre a sí mismo por accidente
     if (String(req.auth.sub) === id) return res.status(400).json({ error: "You cannot delete yourself" });
 
-    const target = users.find((u) => String(u.id) === id);
+    const target = await getUserById(id);
     if (!target) return res.status(404).json({ error: "not found" });
 
-    const admins = countAdmins(users);
-    if (String(target.role) === "admin" && admins <= 1) {
-      return res.status(400).json({ error: "You cannot delete the last admin" });
+    if (String(target.role) === "admin") {
+      const admins = await countAdmins();
+      if (admins <= 1) return res.status(400).json({ error: "You cannot delete the last admin" });
     }
 
-    const next = users.filter((u) => String(u.id) !== id);
-    await writeUsers(next);
-
+    await deleteUser(id);
     return res.json({ ok: true });
   } catch (e) {
     console.error(e);
